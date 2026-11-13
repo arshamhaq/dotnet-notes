@@ -499,3 +499,380 @@ A useful prompt is:
 And remember: a more confident AI answer is not stronger evidence. Our actual SQL logs were stronger evidence than all the earlier guesses.
 
 **The important transition is from “I can run this command” to “I understand why this is the right command, what it will affect, and how I’ll verify the outcome.”** That’s the foundation of doing DevOps engineering well.
+
+# Tracing a problem and fixing it
+
+here I will use as an example a problem I faced and steps to fix it. The api in staging could not access the SQL DB, although the configurations were correct and the DB was online and alive.
+
+**The main problem is that our deployment script registered the API’s identity in SQL using the wrong identifier.** The database account exists and has permissions, but its identity mapping does not match Microsoft’s documented requirements for this kind of application account.
+
+We have prepared a correction and a repair. **We have not yet proved recovery in staging.** That happens when the running API successfully reads the roles after deployment.
+
+Let’s build the explanation from the beginning.
+
+**Your application runs across several separate resources.**
+
+Azure hosts those resources. Azure DevOps stores your repository and runs the automation that builds and deploys your code.
+
+| Component              | Its job in Hydrachem                                         |
+| ---------------------- | ------------------------------------------------------------ |
+| Microsoft Entra tenant | Holds identities for people and applications.                |
+| Azure subscription     | Organizes Azure resources, billing, and access.              |
+| Resource group         | Groups related resources—for example, your staging resources. |
+| Web App Service        | Runs the website that displays the user interface.           |
+| API App Service        | Runs the backend that handles requests and accesses data.    |
+| Azure SQL database     | Stores ERP data, including users and roles.                  |
+| Azure DevOps pipeline  | Runs the build, tests, infrastructure scripts, database scripts, and app deployment. |
+
+When you open the role dropdown, the intended request path is:
+
+````
+```mermaid
+flowchart LR
+    B["Your browser"] --> W["Web App Service"]
+    W --> A["API App Service"]
+    A -->|"Authenticated SQL connection"| D["Staging SQL database"]
+```
+````
+
+The website cannot display roles unless the API successfully retrieves them from SQL.
+
+That is why a database login failure can appear in the browser as an empty dropdown or an internal error.
+
+**The API needs its own identity to access SQL.**
+
+Your own Azure login does not automatically give the running API access.
+
+The API has a **system-assigned managed identity**. Think of it as an account Azure creates and manages specifically for that App Service. The application can obtain a short-lived identity token without us maintaining a database password. The identity is tied to that Azure resource’s lifecycle. [Microsoft’s managed identity explanation](https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview)
+
+There are several separate identities involved:
+
+| Identity                           | What it does                                                 |
+| ---------------------------------- | ------------------------------------------------------------ |
+| Your Azure/Cloud Shell identity    | Lets you inspect resources and run administrative SQL queries. |
+| The pipeline’s deployment identity | Lets Azure DevOps provision resources, run database scripts, and deploy packages. |
+| The API’s managed identity         | Lets the running API connect to SQL during normal use.       |
+| An ERP application user            | Represents someone using Hydrachem, with a business role such as Admin or SalesRep. |
+
+This distinction explains something that initially looked confusing:
+
+> You could query SQL successfully, and previous deployments could succeed, while the API still failed.
+
+Those operations used different identities.
+
+Also, **ERP roles and SQL permissions are different things**:
+
+- `Admin`, `SalesRep`, and `Customer` control behavior inside Hydrachem.
+- `db_datareader`, `db_datawriter`, `CONNECT`, and `EXECUTE` control what a SQL database account can do.
+
+An ERP Admin is not automatically a SQL administrator.
+
+**The mistake happened when deployment created the API’s SQL account.**
+
+The managed identity has two identifiers relevant here:
+
+| Identifier                            | What it identifies                                           |
+| ------------------------------------- | ------------------------------------------------------------ |
+| Object ID, also called principal ID   | The service principal object in your Entra directory.        |
+| Client ID, also called application ID | The application identity associated with that service principal. |
+
+Both are legitimate identifiers. Different Azure operations require different ones.
+
+For the particular SQL command our deployment uses—`CREATE USER ... WITH SID ... TYPE = E`—Microsoft specifies the **client ID** for applications and managed identities. [Microsoft’s exact SQL example](https://learn.microsoft.com/en-us/sql/t-sql/statements/create-user-transact-sql?view=sql-server-ver17#k-create-a-contained-database-user-from-a-microsoft-entra-principal-without-validation)
+
+A **SID** is SQL’s stored security identifier. Here, it is the identifier converted into a 16-byte representation. It is not a password.
+
+Our old deployment effectively did this:
+
+```
+Get the API's object ID
+        ↓
+Convert it into SQL's binary SID format
+        ↓
+Create the API database user with that SID
+        ↓
+Grant reader, writer, and execute permissions
+```
+
+The conversion itself followed the expected byte format. **The wrong identifier went into it.**
+
+The intended process is:
+
+```
+Get the API's client ID
+        ↓
+Convert it into SQL's binary SID format
+        ↓
+Create or validate the matching API database user
+        ↓
+Ensure its required permissions
+```
+
+This SQL creation method does not ask Entra to validate the supplied identity. Consequently, the script could create an account successfully even though the supplied SID represented the wrong identifier.
+
+That explains why “the deployment succeeded” was insufficient evidence that the API could log in.
+
+There was also a second defect. The original script essentially asked:
+
+```
+Does a database user with this name exist?
+
+No  → Create it.
+Yes → Assume it is correct.
+```
+
+It checked the name, but not the identity behind the name.
+
+Therefore, the incorrect account survived later deployments.
+
+**Our investigation separated the identity problem from missing data and missing permissions.**
+
+Your checks established that:
+
+- The three ERP roles exist.
+- The API SQL account exists.
+- It is an Entra account with a 16-byte SID.
+- That SID matches the object ID.
+- It has `CONNECT`, `EXECUTE`, reader, and writer access.
+- The dependency categories inspected were empty.
+- The staging `master` inspection found no matching conflicting account.
+- Your `loginmanager` membership gave that inspection the necessary login visibility.
+- You have full control of the staging application database.
+
+The wrong SID is therefore our strongest explanation for the API’s login rejection.
+
+We still have one distinction to preserve: those checks inspected the database and Azure configuration. They did not directly observe which credential the running API selected. The successful API request after deployment remains the decisive test.
+
+And to revisit your earlier question: **`master` is a system database on the staging SQL server.** It is unrelated to the Git `main` branch and does not mean production.
+
+**The fix needs to address both future deployments and the account that already exists.**
+
+This is why I separated the work into two parts:
+
+| Part                            | Purpose                                                      |
+| ------------------------------- | ------------------------------------------------------------ |
+| Permanent deployment correction | Create correct accounts in the future and reject incompatible existing accounts. |
+| Incident repair                 | Correct the specific account already created incorrectly in staging. |
+
+Changing the deployment recipe does not automatically modify an account already stored in SQL.
+
+That was the missing piece in “couldn’t we just push the code?”
+
+**We can deliver everything through a PR and the pipeline.** The pipeline must explicitly perform the database repair as part of that release.
+
+Uploading the compiled API package by itself would leave the SQL account unchanged.
+
+**The file extensions tell you which system executes each piece.**
+
+| Extension       | Meaning                         | Who uses it?                                             |
+| --------------- | ------------------------------- | -------------------------------------------------------- |
+| `.cs`, `.razor` | Application code                | The running API/Web application after compilation.       |
+| `.ps1`          | PowerShell script               | A developer’s terminal or a pipeline worker.             |
+| `.sql`          | SQL instructions                | The SQL database engine, when a script sends them to it. |
+| `.yml`          | Pipeline configuration          | Azure DevOps, which uses it to schedule tasks.           |
+| `.bicep`        | Azure infrastructure definition | Azure’s deployment system.                               |
+| `.md`           | Human-readable documentation    | Developers and reviewers.                                |
+
+A pipeline worker, also called an **agent**, is the machine Azure DevOps uses to run the job.
+
+For example, a `.ps1` script running on that worker can:
+
+1. Ask Azure for identity information using the `az` command.
+2. Construct a SQL command.
+3. Send that command to SQL using `Invoke-Sqlcmd`.
+4. Stop the job if a check fails.
+
+Opening a `.ps1` or `.sql` file in your editor does not execute it.
+
+Likewise, putting a SQL file in `deployment/sql/` does not make Azure run it automatically. Our PowerShell scripts explicitly load those files.
+
+**Here is what each changed file does.**
+
+| File                                                | What it does                                                 |
+| --------------------------------------------------- | ------------------------------------------------------------ |
+| azure-pipelines.yml                                 | The main pipeline instructions. I added the focused identity tests and enabled the repair parameter for the `DeployDev` stage. |
+| deployment/templates/deploy-environment.yml         | The reusable deployment sequence. It now has an explicitly gated staging repair task before normal database deployment. It also passes the tenant and resource group to the database script. |
+| deployment/scripts/deploy-database.ps1              | The regular database deployment script. It now resolves the client ID and validates the existing account before baseline or migration writes. It retains the existing database initialization and migration responsibilities. |
+| deployment/scripts/SqlIdentity.ps1                  | Shared helper functions for obtaining and validating identity IDs, converting the client ID to a SID, and constructing validation/authorization SQL. |
+| deployment/sql/ApiPrincipalGuard.sql                | The permanent account checks. It rejects an incorrect SID, account type, authentication type, conflicting account, or direct CONNECT/EXECUTE denial. |
+| deployment/scripts/Repair-StagingApiSqlIdentity.ps1 | The incident-specific repair tool. It supports inspection, applying the repair, and explicitly reversing it. |
+| deployment/sql/StagingApiRepairGuard.sql            | The stricter checks needed before replacing this existing account. It verifies the exact reviewed permissions, roles, identity, schema, and dependencies. |
+| deployment/tests/SqlIdentity.Tests.ps1              | Tests the identity logic, SQL checks, and deployment behavior under success and failure conditions. |
+| deployment/tests/Invoke-DeploymentFixture.ps1       | Runs deployment scripts in an isolated test process with fake Azure and SQL commands. This lets us test their behavior without contacting staging. |
+| deployment/STAGING-SQL-IDENTITY-REPAIR.md           | The runbook: evidence, intended changes, execution behavior, rollback, limitations, and acceptance checks. |
+| deployment/README.md                                | Points future developers to the repair and explains that a `dev` release currently includes this SQL operation. |
+| docs/NAVIGATION-PERFORMANCE-MILESTONE.md            | Records how this investigation relates to the existing staging work and makes clear that hosted recovery is still pending. |
+
+The two SQL guard files are **validation fragments**, not ordinary application-data migrations. The PowerShell scripts supply their variables and execute them.
+
+The existing `database/migrations/` directory has a different purpose: it contains forward database changes that the normal deployment script tracks in its migration journal.
+
+**The shared helper fixes the original mistake without requiring you to manually copy IDs each time.**
+
+`SqlIdentity.ps1` asks Azure Resource Manager—the Azure resource-management API—for the API App Service’s managed identity information.
+
+It then checks:
+
+- Are we addressing the expected subscription and tenant?
+- Is the resource the expected API?
+- Does its object ID match the infrastructure output?
+- Is the returned client ID a valid, nonempty identifier?
+
+It uses the **client ID** to construct the SQL SID.
+
+The object ID remains useful for confirming which Azure identity we retrieved. We have not globally replaced every object ID with a client ID.
+
+For regular deployments, the result is:
+
+| Existing database state                               | New behavior                                 |
+| ----------------------------------------------------- | -------------------------------------------- |
+| API account is absent                                 | Create it with the correct client-ID SID.    |
+| API account already has the correct mapping           | Keep it and ensure the required permissions. |
+| API account has an unexpected mapping                 | Stop and report the problem.                 |
+| Another account represents the same expected identity | Stop for review.                             |
+
+That last behavior matters. A routine deployment should not silently replace an unexpected security account.
+
+**“Repair” means correcting the already-existing staging account.**
+
+The repair script is deliberately more specific than the regular deployment script.
+
+It knows the exact staging resource names and the exact old and proposed identifiers from this incident. It checks that they still match before proceeding.
+
+Its three actions are:
+
+| Action     | Behavior                                                     |
+| ---------- | ------------------------------------------------------------ |
+| `Inspect`  | Check the current state and report it. This is the default.  |
+| `Apply`    | Replace the incorrect mapping with the client-ID mapping.    |
+| `Rollback` | Restore the original mapping, after checking the expected state. |
+
+I did not find a documented `ALTER USER ... WITH SID` operation for changing this particular Azure SQL contained Entra user in place.
+
+The prepared repair therefore performs this sequence inside a SQL transaction:
+
+```
+Check the exact account and permissions
+        ↓
+Remove the old SQL account
+        ↓
+Create the same-named account with the client-ID SID
+        ↓
+Restore its reader/writer memberships and CONNECT/EXECUTE grants
+        ↓
+Check the resulting state
+        ↓
+Commit the transaction
+```
+
+Here, “remove the account” means removing a **SQL security principal**.
+
+It does not mean deleting the ERP users table, customers, orders, or business roles. It also does not remove the API’s managed identity from Azure.
+
+Replacing an account can nevertheless lose permissions or affect objects it owns. That is why we inspected dependencies and why the repair repeats those checks immediately before making changes.
+
+The script does not promise to preserve every possible unknown configuration. Instead, it says:
+
+> Proceed only if the account still matches the exact configuration we reviewed. Otherwise, stop.
+
+The repair and normal authorization scripts also share an application lock so cooperating deployments cannot modify the account simultaneously.
+
+**“Rollback” means undoing a change. “Staging” describes where a change runs.**
+
+They describe different things.
+
+A normal staging deployment moves staging forward to a new release. A rollback moves some part of the system back toward a previous state.
+
+There are two rollback situations in this patch.
+
+First, **automatic transaction rollback during the repair**:
+
+Suppose account replacement starts, but restoring a permission fails. The SQL error handler rolls back the transaction. The intended result is that the database does not commit a half-completed replacement.
+
+Second, **an explicitly requested reversal after a successful repair**:
+
+The script’s `Rollback` action reconstructs the original object-ID mapping with the reviewed permissions.
+
+That would restore the previous mapping—and likely the previous login failure. It is a controlled reversal mechanism if we need to investigate unexpected effects, not an action we expect to perform routinely.
+
+Also, a SQL transaction covers only its SQL work.
+
+If the SQL repair commits successfully and a later app-deployment task fails:
+
+- The pipeline reports a failure.
+- The completed SQL repair remains committed.
+- Azure DevOps does not automatically reverse every earlier infrastructure and database operation.
+
+Similarly, reverting a Git commit or deploying an older API package does not automatically restore the database’s previous SID.
+
+There are two separate meanings of “commit” here:
+
+- A **Git commit** records a version of your files.
+- A **SQL transaction commit** makes the database changes in that transaction permanent.
+
+**The staging-only part is intentionally temporary. The permanent fix remains useful.**
+
+The reusable identity lookup and validation apply to normal deployments. When production is eventually provisioned, that code should obtain the production API’s client ID and create its SQL account correctly.
+
+The incident repair is restricted to staging because that is where we inspected an existing broken account.
+
+There are two protections:
+
+1. The deployment template requires the environment to be `dev` and the repair parameter to be enabled.
+2. The repair script itself checks the exact staging resources and identifiers.
+
+Production does not receive the incident repair merely because it uses the same deployment template.
+
+The current staging pipeline contains:
+
+```
+repairStagingSqlIdentity: true
+```
+
+While that remains enabled, each staging deployment runs the repair checks. If the account is already in the exact corrected state, the script skips replacement.
+
+**It does not automatically turn itself off.**
+
+After we confirm recovery, we should remove that flag in a follow-up change. The normal deployment correction stays.
+
+The incident script can remain temporarily for rollback/history and later be archived or removed from active deployment files. Git retains its history. That is normal for a repair written for a specific incident.
+
+**After your PR merges into `dev`, the proposed pipeline runs this sequence.**
+
+1. Build the application and run the required tests.
+2. Package the application and deployment files.
+3. Run the existing infrastructure deployment.
+4. Run the explicitly enabled staging identity repair.
+5. Run normal database validation and any applicable migrations.
+6. Deploy the API and Web application.
+7. Run the existing health checks.
+8. Perform the real application acceptance checks.
+
+The pipeline’s deployment identity performs those operations. Your browser session or Cloud Shell identity is not transferred into the pipeline.
+
+If the repair detects unexpected state, it stops the job before the later API/Web deployment steps.
+
+The `/alive` checks are useful, but they mainly establish that the processes are running. **A green health check does not establish that the API can retrieve SQL data.**
+
+Our acceptance check must include an authenticated request that actually loads the roles.
+
+**The tests provide evidence about the implementation, with a clear limit.**
+
+The 49 focused tests passed. They check situations such as:
+
+- Azure identity lookup fails.
+- The returned subscription, tenant, or identity is wrong.
+- The database user has the wrong SID or type.
+- Permissions or dependencies have changed.
+- Inspection accidentally attempts writes.
+- Deployment should stop before database changes.
+
+Some tests execute the real SQL guards against temporary catalog-like tables in LocalDB. Others use fake Azure/SQL commands to test script behavior.
+
+Generated SQL also passed syntax checking without execution.
+
+Those tests do **not** prove that Azure SQL accepts the real API token, or that the full account replacement has succeeded in Azure. We have not run that live operation yet.
+
+The application’s existing CI tests remain required too. The number 49 describes the new focused checks, not the entire ERP test suite.
+
+The earlier session, authentication, and navigation changes on this branch are separate work. If those commits have not yet reached `dev`, they will also be part of the PR and release, so we need to review the complete branch difference.
